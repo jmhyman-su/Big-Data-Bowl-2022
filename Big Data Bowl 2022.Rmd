@@ -1,0 +1,609 @@
+---
+title: "Big Data Bowl"
+output: html_document
+---
+Read in the data:
+```{r}
+games <- read.csv("games.csv")
+PFF <- read.csv("PFFScoutingData.csv")
+players <- read.csv("players.csv")
+plays <- read.csv("plays.csv")
+tracking2018 <- read.csv("tracking2018.csv")
+tracking2019 <- read.csv("tracking2019.csv")
+tracking2020 <- read.csv("tracking2020.csv")
+```
+
+
+Animating Example Plays
+```{r}
+library(tidyverse)
+
+full_tracking <- rbind(tracking2018, tracking2019, tracking2020)
+
+example_play <- full_tracking %>%
+  filter(gameId == 2018120905 & playId == 3600)
+
+
+#gameId == 2018120905 & playId == 3600gameId == 2020120611 & playId == 3230
+
+library(gifski)
+library(gganimate)
+library(cowplot)
+
+## General field boundaries
+xmin <- 0
+xmax <- 160/3
+hash.right <- 38.35
+hash.left <- 12
+hash.width <- 3.3
+
+
+## Specific boundaries for a given play
+ymin <- max(round(min(example_play$x, na.rm = TRUE) - 10, -1), 0)
+ymax <- min(round(max(example_play$x, na.rm = TRUE) + 10, -1), 120)
+df_hash <- expand.grid(x = c(0, 23.36667, 29.96667, xmax), y = (10:110))
+df_hash <- df_hash %>% filter(!(floor(y %% 5) == 0))
+df_hash <- df_hash %>% filter(y < ymax, y > ymin)
+
+#animate play
+
+animate_play <- ggplot() +
+  scale_size_manual(values = c(6, 4, 6), guide = FALSE) + 
+  scale_shape_manual(values = c(21, 16, 21), guide = FALSE) +
+  scale_fill_manual(values = c("#e31837", "#654321", "#002244"), guide = FALSE) + 
+  scale_colour_manual(values = c("black", "#654321", "#c60c30"), guide = FALSE) + 
+  annotate("text", x = df_hash$x[df_hash$x < 55/2], 
+           y = df_hash$y[df_hash$x < 55/2], label = "_", hjust = 0, vjust = -0.2) + 
+  annotate("text", x = df_hash$x[df_hash$x > 55/2], 
+           y = df_hash$y[df_hash$x > 55/2], label = "_", hjust = 1, vjust = -0.2) + 
+  annotate("segment", x = xmin, 
+           y = seq(max(10, ymin), min(ymax, 110), by = 5), 
+           xend =  xmax, 
+           yend = seq(max(10, ymin), min(ymax, 110), by = 5)) + 
+  annotate("text", x = rep(hash.left, 11), y = seq(10, 110, by = 10), 
+                    label = c("G   ", seq(10, 50, by = 10), rev(seq(10, 40, by = 10)), "   G"), 
+                    angle = 270, size = 4) + 
+  annotate("text", x = rep((xmax - hash.left), 11), y = seq(10, 110, by = 10), 
+           label = c("   G", seq(10, 50, by = 10), rev(seq(10, 40, by = 10)), "G   "), 
+           angle = 90, size = 4) + 
+  annotate("segment", x = c(xmin, xmin, xmax, xmax), 
+           y = c(ymin, ymax, ymax, ymin), 
+           xend = c(xmin, xmax, xmax, xmin), 
+           yend = c(ymax, ymax, ymin, ymin), colour = "black") + 
+  geom_point(data = example_play, aes(x = (xmax-y), y = x, shape = team,
+                                 fill = team, group = nflId, size = team, colour = team), alpha = 0.7) + 
+  geom_text(data = example_play, aes(x = (xmax-y), y = x, label = jerseyNumber), colour = "white", 
+            vjust = 0.36, size = 3.5) + 
+  ylim(ymin, ymax) + 
+  coord_fixed() +  
+  theme_nothing() + 
+  transition_time(frameId)  +
+  ease_aes('linear') + 
+  NULL 
+
+animate_play
+
+anim_save("CyrusJones.gif", animation = animate_play)
+
+puntsPFF %>%
+  filter(gameId == 2018120905 & playId == 3600)
+```
+
+Creatin Catch Location Variable
+```{r}
+punts <- plays %>%
+  filter(specialTeamsPlayType == "Punt")
+
+puntsPFF <- PFF %>%
+  filter(!is.na(snapDetail))
+
+puntsPFF <- merge(puntsPFF, punts, by = c("gameId", "playId"))
+
+puntreturns <- puntsPFF %>%
+  filter(specialTeamsResult == 'Return' & is.na(penaltyCodes))
+
+puntreturns <- puntreturns %>%
+  mutate(catchLoc = ifelse(is.na(yardlineSide), abs(yardlineNumber - kickLength),
+                           ifelse(possessionTeam != yardlineSide, abs(yardlineNumber - kickLength),
+                                  ifelse(possessionTeam == yardlineSide, abs(100 - yardlineNumber - kickLength), 1))))
+
+```
+
+Initial Model using non tracking variables
+```{r}
+library(stats)
+library(xgboost)
+library(purrr)
+
+#credit to Tej Seth for outline of model code
+#set limit of punt return yardage to be 30 
+puntreturns <- puntreturns %>%
+  mutate(yards_returned = case_when(kickReturnYardage > 30 ~ 30L, kickReturnYardage < -5 ~ -5L, TRUE ~ as.integer(kickReturnYardage)), label = yards_returned + 5L)
+
+puntreturns <- puntreturns %>%
+  select(snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc, label) %>%
+  filter(!is.na(label)) 
+
+#model creation/partioning
+smp_size <- floor(0.75 * nrow(puntreturns))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(puntreturns)), size = smp_size)
+train <- puntreturns[train_ind, ]
+test <- puntreturns[-train_ind, ]
+
+#parameters
+nrounds <- 100
+params <-
+  list(booster = "gbtree",objective = "multi:softprob",
+    eval_metric = c("mlogloss"),
+    num_class = 36,
+    eta = .3,
+    gamma = 1,
+    subsample=0.75,
+    colsample_bytree=0.75,
+    max_depth = 6,
+    min_child_weight = 1
+  )
+
+#train model, feature importance
+full_train <- xgb.DMatrix(as.matrix(train %>% select(-label)), label = as.integer(train$label))
+
+retyoe_model <- xgboost(params = params, data = full_train, nrounds = nrounds, verbose = 2)
+
+imp <- xgb.importance(colnames(train  %>% select(-label)), model = retyoe_model)
+xgb.plot.importance(imp)
+
+#prepare df for predictions
+puntreturns <- puntreturns %>%
+  select(snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc) %>%
+  mutate(index = 1:n())
+
+#create predictions
+retyoe_all <- predict(retyoe_model, as.matrix(puntreturns %>% select(snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc))) %>%
+  tibble::as_tibble() %>%
+  rename(prob = "value") %>%
+  bind_cols(purrr::map_dfr(seq_along(puntreturns$index), function(x) {
+    tibble::tibble("xyds_returned" = -5:30,
+                   "snapTime" = puntreturns$snapTime[[x]],
+                   "operationTime" = puntreturns$operationTime[[x]],
+                   "hangTime" = puntreturns$hangTime[[x]],
+                   "quarter" = puntreturns$quarter[[x]],
+                   "yardsToGo" = puntreturns$yardsToGo[[x]],
+                   "kickLength" = puntreturns$kickLength[[x]],
+                   "yardlineNumber" = puntreturns$yardlineNumber[[x]],
+                   "catchLoc" = puntreturns$catchLoc[[x]],
+                   "index" = puntreturns$index[[x]]) 
+  })) %>%
+  group_by(.data$index) %>%
+  mutate(cum_prob = cumsum(.data$prob)) %>%
+  select(-.data$cum_prob) %>%
+  summarise(x_return_yards = sum(.data$prob * .data$xyds_returned)) %>%
+  ungroup() 
+  
+#join predictions with all punt, game, and player information
+returns2 <- puntreturns %>%
+  inner_join(retyoe_all)
+
+puntreturnsTest <- puntsPFF %>%
+  filter(specialTeamsResult == 'Return' & is.na(penaltyCodes), !is.na(kickReturnYardage))
+
+puntreturnsTest <- puntreturnsTest %>%
+  mutate(yards_returned = case_when(kickReturnYardage > 30 ~ 30L, kickReturnYardage < -5 ~ -5L, TRUE ~ as.integer(kickReturnYardage)), label = yards_returned + 5L)
+
+all_punts <- puntreturnsTest %>%
+  inner_join(returns2) %>%
+  select(gameId, playId, returnerId, yards_returned, kickReturnYardage, x_return_yards) %>%
+  mutate(retyoe = yards_returned - x_return_yards)
+
+
+#summarize average return yards over expected 
+returners <- all_punts %>%
+  group_by(returnerId) %>%
+  summarize(returns = n(),
+            sum_retyoe = sum(retyoe, na.rm = T),
+            avg_retyoe = mean(retyoe, na.rm =T)) %>%
+  filter(returns > 1) %>%
+  arrange(desc(avg_retyoe))
+
+#match players and IDs
+player_names <- players %>%
+  select(nflId, displayName)
+
+player_names$nflId <- as.character(player_names$nflId)
+
+returners <- merge(returners, player_names, by.x = "returnerId", by.y = "nflId")
+
+#examples
+returnersTest <- merge(all_punts, player_names, by.x = "returnerId", by.y = "nflId")
+returnersTest %>%
+  filter(displayName == "Keelan Cole")
+
+```
+
+```{r}
+#tracking data prep
+
+trackingReceived <- full_tracking %>%
+  filter(event == "punt_received")
+
+trackingReceived <- trackingReceived %>%
+  group_by(gameId, playId) %>%
+  mutate(index = 1:n())
+
+puntreturnsTest <- puntsPFF %>%
+  filter(specialTeamsResult == 'Return' & is.na(penaltyCodes), !is.na(kickReturnYardage))
+
+puntreturnsTest <- puntreturnsTest %>%
+  mutate(yards_returned = case_when(kickReturnYardage > 30 ~ 30L,
+                                  kickReturnYardage < -5 ~ -5L,
+                                TRUE ~ as.integer(kickReturnYardage)),
+         label = yards_returned + 5L)
+
+puntreturnsTest <- merge(puntreturnsTest, player_names, by.x = "returnerId", by.y = "nflId")
+games <- games %>%
+  select(gameId, homeTeamAbbr, visitorTeamAbbr)
+puntreturnsTest <- merge(puntreturnsTest, games, by = "gameId")
+
+trackingReceivedCom <- merge(trackingReceived, puntreturnsTest, by = c("gameId", "playId"))
+  
+trackingReceivedCom <- trackingReceivedCom %>%
+  arrange(gameId, playId, index)
+
+#create distance to the football for each player
+distance <- trackingReceivedCom %>% 
+  select(gameId, playId, x, y) %>%
+  group_by(gameId, playId) %>% 
+  mutate_each(function(x) (last(x) - x)^2) %>%
+  ungroup() %>%
+  mutate(euc.dist = sqrt(rowSums(select(.,-c(1:2))))) %>%
+  select(euc.dist)
+
+trackingReceivedCom$distance <- distance$euc.dist
+colnames(trackingReceivedCom)[which(names(trackingReceivedCom) == "displayName.y")] <- "Returner"
+
+trackingReceivedCom <- trackingReceivedCom %>%
+  mutate(Returner_dummy = ifelse(Returner == displayName.x, 1, 0))
+
+#separate offense and defense
+trackingReceivedCom <- trackingReceivedCom %>%
+  mutate(player_team= ifelse(team == 'home', homeTeamAbbr, 
+                             ifelse(team == 'away',visitorTeamAbbr, 'ball')))
+
+#create three closest defender variables
+closestdefFull <- trackingReceivedCom %>%
+  group_by(gameId, playId) %>%
+  filter(displayName.x != Returner & displayName.x != "football" & player_team == possessionTeam) %>%
+  mutate(defender1 = as.integer(distance == min(distance)))
+
+closestdef2 <- closestdefFull %>%
+  group_by(gameId, playId) %>%
+  filter(displayName.x != Returner & displayName.x != "football" & player_team == possessionTeam & defender1 == 0) %>%
+  mutate(defender2 = as.integer(distance == min(distance)))
+  
+closestdef3 <- closestdef2 %>%
+  group_by(gameId, playId) %>%
+  filter(displayName.x != Returner & displayName.x != "football" & player_team == possessionTeam & defender1 == 0 & defender2 == 0) %>%
+  mutate(defender3 = as.integer(distance == min(distance)))
+
+closestdefFull <- closestdefFull %>%
+  filter(defender1 == 1) 
+closestdef2 <- closestdef2 %>%
+  filter(defender2 == 1)
+closestdef3 <- closestdef3 %>%
+  filter(defender3 == 1)
+
+#make one row per play
+closestdefFull <- plyr::rbind.fill(closestdefFull, closestdef2, closestdef3) 
+closestdefFull <- closestdefFull %>%
+  select(gameId, playId, x, y, s, a, o, dir, displayName.x, jerseyNumber, distance, defender1, defender2, defender3)
+closestdefFull[is.na(closestdefFull)] <- 0
+
+closestdefFull <- closestdefFull %>%
+  mutate(defender = ifelse(defender1 == 1, "defender1", 
+                           ifelse(defender2 == 1, "defender2", "defender3"))) %>%
+  select(-c(defender1, defender2, defender3))
+
+wideDef <- closestdefFull %>%
+  group_by(gameId, playId) %>%
+  pivot_wider(names_from = defender, values_from = c(x, y, s, a, o, dir, displayName.x, jerseyNumber, distance))
+
+returner <- trackingReceivedCom %>%
+  filter(Returner_dummy == 1)
+
+returner <- returner %>%
+  mutate(catchLoc = ifelse(is.na(yardlineSide), abs(yardlineNumber - kickLength),
+                           ifelse(possessionTeam != yardlineSide, abs(yardlineNumber - kickLength),
+                                  ifelse(possessionTeam == yardlineSide, abs(100 - yardlineNumber - kickLength), 1))))
+returner <- returner %>%
+  select(gameId, playId, x, y, s, a, o, dir, displayName.x, jerseyNumber, distance, snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, kickReturnYardage, catchLoc)
+
+#create distance to sideline variable
+returner <- returner %>%
+  mutate(distToSide = ifelse(y > 26.65, 53.3 - y, 
+                             ifelse(y < 26.55, y, 26.65)))
+
+full_model_data <- merge(returner, wideDef, by = c("gameId", "playId"))
+
+#create slope to returner variable
+full_model_data <- full_model_data %>%
+  mutate(sloped1 = abs((y_defender1 - y )/(x_defender1 - x)),
+         sloped2 = abs((y_defender2 - y )/(x_defender2 - x)),
+         sloped3 = abs((y_defender3 - y )/(x_defender3- x)))
+
+```
+
+```{r}
+#same model set up as previous iteration, now with tracking variables included 
+full_model_data <- full_model_data %>%
+  mutate(yards_returned = case_when(kickReturnYardage > 30 ~ 30L,
+                                  kickReturnYardage < -5 ~ -5L,
+                                TRUE ~ as.integer(kickReturnYardage)),
+         label = yards_returned + 5L)
+
+full_model_data <- full_model_data %>%
+  select(s, dir, distToSide, distance_defender1, distance_defender2, distance_defender3, sloped1, sloped2, sloped3, s_defender1, s_defender2, s_defender3, snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc, label) %>%
+  filter(!is.na(label)) 
+
+smp_size <- floor(0.75 * nrow(full_model_data))
+set.seed(456)
+train_ind <- sample(seq_len(nrow(full_model_data)), size = smp_size)
+train <- full_model_data[train_ind, ]
+test <- puntreturns[-train_ind, ]
+
+nrounds <- 100
+params <-
+  list(
+    booster = "gbtree",
+    objective = "multi:softprob",
+    eval_metric = c("mlogloss"),
+    num_class = 36,
+    eta = .3,
+    gamma = 1,
+    subsample=0.75,
+    colsample_bytree=0.75,
+    max_depth = 6,
+    min_child_weight = 1
+  )
+
+full_train <- xgb.DMatrix(as.matrix(train %>% select(-label)), label = as.integer(train$label))
+
+retyoe_model <- xgboost(params = params, data = full_train, nrounds = nrounds, verbose = 2)
+
+imp <- xgb.importance(colnames(train  %>% select(-label)), model = retyoe_model)
+imp <- xgb.plot.importance(imp)
+  
+imp %>%
+  ggplot() + 
+  geom_bar(aes(x=Importance,y=reorder(Feature, Importance)),stat="identity", fill = "darkblue") +
+  labs(title = "Feature Importance for Final XGBoost Model", y = "Feature") +
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))
+  
+ggsave("impPlot.png")
+
+full_model_data <- full_model_data %>%
+  select(s, dir, distToSide, distance_defender1, distance_defender2, distance_defender3, sloped1, sloped2, sloped3, s_defender1, s_defender2, s_defender3, snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc) %>%
+  mutate(index = 1:n())
+
+
+retyoe_all <- predict(retyoe_model,
+                            as.matrix(full_model_data %>%
+                                        select(s, dir, distToSide, distance_defender1, distance_defender2, distance_defender3, sloped1, sloped2, sloped3, s_defender1, s_defender2, s_defender3, snapTime, operationTime, hangTime, quarter, yardsToGo, kickLength, yardlineNumber, catchLoc))) %>%
+  tibble::as_tibble() %>%
+  rename(prob = "value") %>%
+  bind_cols(purrr::map_dfr(seq_along(full_model_data$index), function(x) {
+    tibble::tibble("xyds_returned" = -5:30,
+                   "s" = full_model_data$s[[x]],
+                   "dir" = full_model_data$dir[[x]],
+                   "distToSide" = full_model_data$distToSide[[x]],
+                   "distance_defender1" = full_model_data$distance_defender1[[x]],
+                   "distance_defender2" = full_model_data$distance_defender2[[x]],
+                   "distance_defender3" = full_model_data$distance_defender3[[x]],
+                   "sloped1" = full_model_data$sloped1[[x]],
+                   "sloped2" = full_model_data$sloped2[[x]],
+                   "sloped3" = full_model_data$sloped3[[x]],
+                   "s_defender1" = full_model_data$s_defender1[[x]],
+                   "s_defender2" = full_model_data$s_defender2[[x]],
+                   "s_defender3" = full_model_data$s_defender3[[x]],
+                   "snapTime" = full_model_data$snapTime[[x]],
+                   "operationTime" = full_model_data$operationTime[[x]],
+                   "hangTime" = full_model_data$hangTime[[x]],
+                   "quarter" = full_model_data$quarter[[x]],
+                   "yardsToGo" = full_model_data$yardsToGo[[x]],
+                   "kickLength" = full_model_data$kickLength[[x]],
+                   "yardlineNumber" = full_model_data$yardlineNumber[[x]],
+                   "catchLoc" = full_model_data$catchLoc[[x]],
+                   "index" = full_model_data$index[[x]]) 
+  })) %>%
+  group_by(.data$index) %>%
+  mutate(cum_prob = cumsum(.data$prob)) %>%
+  select(-.data$cum_prob) %>%
+  summarise(x_return_yards = sum(.data$prob * .data$xyds_returned)) %>%
+  ungroup() 
+  
+
+returns2 <- full_model_data %>%
+  inner_join(retyoe_all)
+
+puntreturnsTest <- puntsPFF %>%
+  filter(specialTeamsResult == 'Return' & is.na(penaltyCodes), !is.na(kickReturnYardage))
+
+puntreturnsTest <- puntreturnsTest %>%
+  mutate(yards_returned = case_when(kickReturnYardage > 30 ~ 30L,
+                                  kickReturnYardage < -5 ~ -5L,
+                                TRUE ~ as.integer(kickReturnYardage)),
+         label = yards_returned + 5L)
+
+all_punts <- puntreturnsTest %>%
+  inner_join(returns2) %>%
+  select(gameId, playId, returnerId, yards_returned, kickReturnYardage, x_return_yards) %>%
+  mutate(retyoe = yards_returned - x_return_yards)
+
+
+returners <- all_punts %>%
+  group_by(returnerId) %>%
+  summarize(returns = n(),
+            sum_retyoe = sum(retyoe, na.rm = T),
+            avg_retyoe = mean(retyoe, na.rm =T)) %>%
+  filter(returns > 1) %>%
+  arrange(desc(avg_retyoe))
+
+
+#match players and IDs
+
+player_names <- players %>%
+  select(nflId, displayName)
+
+player_names$nflId <- as.character(player_names$nflId)
+
+returners <- merge(returners, player_names, by.x = "returnerId", by.y = "nflId")
+
+returnersTest <- merge(all_punts, player_names, by.x = "returnerId", by.y = "nflId")
+returnersTest %>%
+  filter(displayName == "Cyrus Jones")
+
+#actual return hist versus predicted
+puntreturnsTest %>%
+  ggplot(aes(fill = "blue")) +
+  geom_histogram(aes(x = kickReturnYardage), fill="darkblue") +
+  labs(title = "Distribution of Punt Return Yardage", x = "Return Yards", y = "Frequency") +
+  theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5))
+hist(returnersTest$x_return_yards)
+ggsave("ReturnYardage.png")
+```
+
+```{r}
+#create retyoe rank chart
+#if (!require("remotes")) install.packages("remotes")
+#emotes::install_github("nflverse/nflfastR")
+library(nflfastR)
+seasons <- 2018:2020
+pbp <- load_pbp(seasons)
+
+pbpPunt <- pbp %>%
+  select(old_game_id, play_id, punt_returner_player_id) %>%
+  filter(!is.na(punt_returner_player_id))
+
+colnames(pbpPunt)[which(names(pbpPunt) == "old_game_id")] <- "gameId"
+colnames(pbpPunt)[which(names(pbpPunt) == "play_id")] <- "playId"
+
+#load headshot code here: headshot_gsis_map.rds
+#merge pbp for player images 
+allPuntswId <- merge(all_punts, pbpPunt, by = c("gameId", "playId"))
+allPuntswId <- allPuntswId %>% select(returnerId, punt_returner_player_id)
+returners <- merge(returners, allPuntswId, by = "returnerId", all.x = TRUE)
+returners <- merge(returners, headshot_gsis_map, by.x = "punt_returner_player_id", by.y = "gsis_id")
+returners <- returners %>%
+  distinct()
+
+library(gt)
+library(gtExtras)
+#create table
+table <- returners %>%
+  arrange(-avg_retyoe) %>%
+  filter(returns >= 10) %>%
+  mutate(Rank = 1:n()) %>%
+  select(Rank, displayName, headshot_nfl, avg_retyoe) %>%
+  dplyr::slice(1:10, 59:68) %>%
+  gt() %>%
+  gt_img_rows(columns = headshot_nfl) %>%
+  tab_header(
+    title = "Return Yards over Expected for Returned Punts",
+    subtitle = "Minimum 10 Returns from 2018-2020") %>%
+  cols_label(
+    displayName = "Returner",
+    headshot_nfl = "",
+    avg_retyoe = "RetYOE") %>%
+  data_color(
+    columns = c(avg_retyoe),
+    colors = scales::col_numeric(
+      palette = c("#FF0000", "#f7f7f7", "#7fbf7b"),
+      domain = c(-2, 3)
+    ))
+
+table %>%
+  gtsave(
+    "RETYOE.png", expand = 10
+  )
+```
+
+
+Random EDA
+```{r}
+#kickoff catch location analysis
+kickoffs <- plays %>%
+  filter(specialTeamsPlayType == 'Kickoff' & is.na(penaltyCodes) & (absoluteYardlineNumber == 45 | absoluteYardlineNumber == 75))
+
+kickoffs <- kickoffs %>%
+  mutate(EndFieldPos = 65 - playResult)
+
+kickoffs <- kickoffs %>%
+  mutate(CatchLocation = 65 - kickLength)
+
+kickoffs %>%
+  group_by(specialTeamsResult) %>%
+  summarise(EFP = mean(EndFieldPos))
+
+kickoffs %>%
+  #filter(specialTeamsResult == 'Return') %>%
+  group_by(CatchLocation) %>%
+  summarise(EFP = mean(EndFieldPos)) %>%
+  ggplot() +
+  geom_bar(aes(x=CatchLocation,y=EFP-25),stat="identity") +
+  xlim(-10, 10)
+
+```
+
+```{r}
+#ending field position based on where kick landed
+prekickoffPen <- plays %>%
+  filter(specialTeamsPlayType == 'Kickoff' & is.na(penaltyCodes) & (absoluteYardlineNumber == 60))
+
+prekickoffPen <- prekickoffPen %>%
+  mutate(EndFieldPos = 50 - playResult)
+
+prekickoffPen <- prekickoffPen %>%
+  mutate(CatchLocation = 50 - kickLength)
+
+prekickoffPen %>%
+  group_by(specialTeamsResult) %>%
+  summarise(EFP = mean(EndFieldPos))
+
+prekickoffPen %>%
+  group_by(CatchLocation) %>%
+  summarise(EFP = mean(EndFieldPos)) %>%
+  ggplot() +
+  geom_bar(aes(x=CatchLocation,y=EFP-24.9),stat="identity") +
+  xlim(-11, 10)
+```
+
+```{r}
+#onside nonsense
+onsidesPFF <- PFF %>%
+  filter(kickType == "O")
+
+onsidesPFF <- merge(onsidesPFF, kickoffs, by = c("gameId", "playId"))
+
+speed_data <- tracking2018 %>%
+  filter(team == "football") %>%
+  group_by(gameId, playId) %>%
+  summarise(max_speed = max(s)) 
+
+onsidesPFF <- merge(onsidesPFF, speed_data, by = c("gameId", "playId"))
+  
+
+```
+
+```{r}
+#football speed graphs (?)
+example_play %>%
+  filter(team == "football") %>%
+  ggplot(aes(x = frameId, y = s)) +
+  geom_point()
+
+example_play %>%
+  filter(team == "football") %>%
+  ggplot(aes(x = frameId, y = a)) +
+  geom_point()
+```
